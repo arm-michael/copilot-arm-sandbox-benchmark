@@ -37,6 +37,12 @@ TREATMENTS = {
     "native": {"runner_label": "ubuntu-24.04-arm", "host_arch": "arm64"},
 }
 
+WORKLOAD_LABELS = {"cpython": "CPython"}
+
+
+def workload_label(value):
+    return WORKLOAD_LABELS.get(value, value.replace("-", " ").title())
+
 
 def load_records(paths):
     records = []
@@ -192,9 +198,22 @@ def vm_medians(records):
     return medians
 
 
-def pairing_analysis(records):
+def pairing_analysis(records, expected_git_sha=None):
     records = list(records)
     medians, group_errors = vm_analysis(records)
+    if expected_git_sha is not None:
+        if not expected_git_sha.strip():
+            raise ValueError("expected_git_sha must not be blank")
+        retained_git_shas = {
+            row["git_sha"] for row in records if row["trial_class"] == "retained"
+        }
+        if retained_git_shas != {expected_git_sha}:
+            observed = ", ".join(sorted(retained_git_shas)) or "no retained records"
+            raise ValueError(
+                "expected retained records at harness git_sha {}, observed {}".format(
+                    expected_git_sha, observed
+                )
+            )
     treatments = {}
     for row in medians:
         key = (row["block_id"], row["workload"], row["phase"])
@@ -229,6 +248,13 @@ def pairing_analysis(records):
             verifications.setdefault(key, {}).setdefault(
                 row["execution_mode"], []
             ).append(row)
+    attempts = {}
+    for row in records:
+        if row["trial_class"] == "retained" and row["phase"] == "attempt":
+            key = (row["block_id"], row["workload"], "build-test")
+            attempts.setdefault(key, {}).setdefault(row["execution_mode"], []).append(
+                row
+            )
     pairs = []
     exclusions = []
     for block_id, workload, phase in sorted(primary_keys):
@@ -253,6 +279,35 @@ def pairing_analysis(records):
             relevant_errors.append("blank git_sha in retained block")
         if len(git_shas) > 1:
             relevant_errors.append("treatments or phases use different git_sha values")
+        attempt_modes = attempts.get(pair_key, {})
+        for mode in sorted(TREATMENTS):
+            rows = attempt_modes.get(mode, [])
+            if not rows:
+                relevant_errors.append("missing {} attempt record".format(mode))
+            elif len(rows) > 1:
+                relevant_errors.append("duplicate {} attempt record".format(mode))
+            elif rows[0]["exit_code"] != 0:
+                relevant_errors.append(
+                    "{} attempt record failure (exit {})".format(
+                        mode, rows[0]["exit_code"]
+                    )
+                )
+            else:
+                primary_counts = {
+                    row["expected_repetitions"]
+                    for row in block_rows
+                    if row["phase"] == "build-test"
+                    and row["execution_mode"] == mode
+                }
+                if (
+                    len(primary_counts) == 1
+                    and rows[0]["expected_repetitions"] != next(iter(primary_counts))
+                ):
+                    relevant_errors.append(
+                        "{} attempt repetition count does not match primary timing".format(
+                            mode
+                        )
+                    )
         verification_modes = verifications.get(pair_key, {})
         for mode in sorted(TREATMENTS):
             rows = verification_modes.get(mode, [])
@@ -335,6 +390,21 @@ def pairing_analysis(records):
                 "git_sha": next(iter(git_shas)),
             }
         )
+    pair_git_shas = {row["git_sha"] for row in pairs}
+    if len(pair_git_shas) > 1:
+        raise ValueError(
+            "multiple harness git_sha values would be aggregated: {}".format(
+                ", ".join(sorted(pair_git_shas))
+            )
+        )
+    if expected_git_sha is not None:
+        if pair_git_shas != {expected_git_sha}:
+            observed = ", ".join(sorted(pair_git_shas)) or "no complete pairs"
+            raise ValueError(
+                "expected harness git_sha {}, observed {}".format(
+                    expected_git_sha, observed
+                )
+            )
     return pairs, exclusions
 
 
@@ -358,6 +428,8 @@ def percentile(sorted_values, probability):
 def bootstrap_ci(values, samples=10000, seed=20260903):
     if not values:
         raise ValueError("at least one speedup is required")
+    if samples < 1:
+        raise ValueError("bootstrap samples must be positive")
     rng = random.Random(seed)
     estimates = []
     for _ in range(samples):
@@ -367,9 +439,9 @@ def bootstrap_ci(values, samples=10000, seed=20260903):
     return percentile(estimates, 0.025), percentile(estimates, 0.975)
 
 
-def render_markdown(records, bootstrap_samples):
+def render_markdown(records, bootstrap_samples, expected_git_sha=None):
     records = list(records)
-    pairs, exclusions = pairing_analysis(records)
+    pairs, exclusions = pairing_analysis(records, expected_git_sha=expected_git_sha)
     groups = {}
     for row in pairs:
         key = (row["workload"], row["phase"])
@@ -378,10 +450,12 @@ def render_markdown(records, bootstrap_samples):
     lines = [
         "# Benchmark results",
         "",
+        "Harness commit: `{}`.".format(pairs[0]["git_sha"] if pairs else "none"),
+        "",
         "Generated from append-only JSONL records. Speedup is x64-hosted QEMU time divided by native ARM64 time; values above 1 favor native ARM64.",
         "",
-        "| Workload | Phase | Paired observations | Median x64 + QEMU | Median native ARM64 | Median speedup | Geometric mean speedup | Paired bootstrap 95% CI |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Workload | Phase | Paired observations | Pairs favoring native | Median x64 + QEMU | Median native ARM64 | Median speedup | Geometric mean speedup | Exploratory paired bootstrap 95% interval |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     range_lines = []
     for (workload, phase), group_pairs in sorted(groups.items()):
@@ -399,9 +473,11 @@ def render_markdown(records, bootstrap_samples):
             low, high = bootstrap_ci(values, samples=bootstrap_samples)
             confidence_interval = "{:.2f}x–{:.2f}x".format(low, high)
         lines.append(
-            "| {} | {} | {} paired blocks | {:.2f} s | {:.2f} s | {:.2f}x | {:.2f}x | {} |".format(
-                workload.replace("-", " ").title(),
+            "| {} | {} | {} paired blocks | {}/{} | {:.2f} s | {:.2f} s | {:.2f}x | {:.2f}x | {} |".format(
+                workload_label(workload),
                 phase.replace("-", " "),
+                len(values),
+                sum(value > 1 for value in values),
                 len(values),
                 emulated_seconds,
                 native_seconds,
@@ -412,15 +488,23 @@ def render_markdown(records, bootstrap_samples):
         )
         range_lines.append(
             "Observed paired speedup range for {}: {:.2f}x–{:.2f}x.".format(
-                workload.replace("-", " ").title(), min(values), max(values)
+                workload_label(workload), min(values), max(values)
             )
         )
     if not groups:
         lines.append(
-            "| No complete pairs | — | 0 paired blocks | — | — | — | — | — |"
+            "| No complete pairs | — | 0 paired blocks | — | — | — | — | — | — |"
         )
     if range_lines:
         lines.extend([""] + range_lines)
+        lines.extend(
+            [
+                "",
+                "Treatment-time columns are marginal medians across blocks; median speedup is the median of within-block ratios and need not equal their quotient.",
+                "Separate fresh-VM blocks are treated as analysis units, but shared fleet and time-window effects can correlate them.",
+                "The bootstrap interval is exploratory for this small convenience cohort; the paired values, direction count, and observed range are the primary interpretation.",
+            ]
+        )
     primary = list(primary_records(records))
     successful = sum(row["exit_code"] == 0 for row in primary)
     attempts = [
@@ -496,18 +580,26 @@ def parse_args(argv=None):
     parser.add_argument("--csv", required=True, type=Path)
     parser.add_argument("--pairs-csv", required=True, type=Path)
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
-    return parser.parse_args(argv)
+    parser.add_argument("--expected-git-sha")
+    args = parser.parse_args(argv)
+    if args.bootstrap_samples < 1:
+        parser.error("--bootstrap-samples must be positive")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
         records = load_records(args.inputs)
-        report = render_markdown(records, args.bootstrap_samples)
+        report = render_markdown(
+            records,
+            args.bootstrap_samples,
+            expected_git_sha=args.expected_git_sha,
+        )
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
         args.markdown.write_text(report, encoding="utf-8")
         write_csv(records, args.csv)
-        pairs, _ = pairing_analysis(records)
+        pairs, _ = pairing_analysis(records, expected_git_sha=args.expected_git_sha)
         write_csv(
             pairs,
             args.pairs_csv,

@@ -1,0 +1,8 @@
+runner_label=ubuntu-24.04-arm
+treatment=arm64-native
+target_platform=linux/arm64
+image_os=ubuntu24-arm64
+image_version=20260831.111.1
+workflow_run_id=33790863851
+workflow_run_attempt=1
+git_sha=b9d8f62d3a874ecc1fcab110476afec6397f63eb

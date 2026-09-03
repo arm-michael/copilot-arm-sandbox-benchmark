@@ -4,7 +4,7 @@
 
 **Goal:** Build and run a reproducible paired GitHub Actions experiment comparing Linux/ARM64 workloads under x64-hosted QEMU with native ARM64 execution, then publish a reviewed GitHub proposal.
 
-**Architecture:** A matrix workflow dispatches identical pinned workloads to equal-size x64 and ARM64 public runners. Small Python utilities checksum fixtures, measure subprocesses into JSONL, and analyze paired fresh-VM observations; Dockerfiles force the ARM64 target platform and contain the real compile/test work.
+**Architecture:** A matrix workflow dispatches identical pinned workloads to x64 and ARM64 public runners with the same advertised resource envelope. Small Python utilities checksum fixtures, measure subprocesses into JSONL, and analyze paired fresh-VM observations; Dockerfiles force the ARM64 target platform and contain the real compile/test work.
 
 **Tech Stack:** GitHub Actions, Ubuntu 24.04 x64/ARM64 runners, Docker Buildx, QEMU/binfmt, Python 3 standard library, `unittest`, pinned upstream source archives.
 
@@ -78,7 +78,6 @@
 **Files:**
 - Create: `tests/test_workflow_contract.py`
 - Create: `.github/workflows/benchmark.yml`
-- Create: `scripts/run_workload.sh`
 
 **Interfaces:**
 - Manual inputs: `workload` (`smoke`, `brotli`, `cpython`, or `all`) and `repetitions` (positive integer).
@@ -87,7 +86,7 @@
 
 - [ ] Write static workflow tests that require both exact runner labels, QEMU setup only on x64, Buildx setup after QEMU, four-core and `aarch64` gates, fixture fetch before timing, measurement wrapper use, and result upload on success or failure.
 - [ ] Run `python3 -m unittest tests.test_workflow_contract -v`; verify the absent workflow failure.
-- [ ] Implement the workflow and shell coordinator, pinning official action commits and the QEMU image reference used by the setup action.
+- [ ] Implement the workflow, pinning official action commits and the QEMU image reference used by the setup action.
 - [ ] Run all unit tests and `actionlint .github/workflows/benchmark.yml`; require zero failures.
 - [ ] Commit and push with message `ci: add paired arm64 benchmark workflow`.
 
@@ -102,7 +101,9 @@
 - [ ] Dispatch one smoke pair and inspect architecture, binfmt, runner metadata, artifacts, and logs.
 - [ ] Dispatch one Brotli and one CPython pilot pair; classify failures before changing the harness.
 - [ ] After each correction, add a failing regression test first, then rerun the affected pilot.
-- [ ] Dispatch at least five independent successful paired blocks per retained workload.
+- [ ] After freezing the harness, dispatch at least five retained paired blocks
+  per workload. The completed collection stopped at five in two waves, retained
+  every dispatch, and did not replace failures or extend based on outcomes.
 - [ ] Download artifacts without rewriting them, verify record counts/checksums, and run `scripts/analyze.py`.
 - [ ] Have independent reviewers assess code correctness, experimental validity, and claim discipline; resolve all critical/important issues.
 - [ ] Commit raw data, analysis, and corrections with traceable workflow URLs.
@@ -115,9 +116,10 @@
 - Create: `PROPOSAL.md`
 - Create: `SOURCES.md`
 
-- [ ] Write the proposal around Linux/ARM64 containers/cloud services, using native packages as the proof case and Android/embedded only as secondary beneficiaries.
+- [ ] Write the proposal around direct Linux/ARM64 service, runtime, package,
+  and native-dependency development. Treat container-image loops as conditional
+  on documented/supported sandbox tooling and Android/embedded as out of scope.
 - [ ] Separate sourced facts, measured results, and inferences; include counterarguments, limitations, an opt-in MVP, and immutable run links.
 - [ ] Re-run all tests, workflow lint, result analysis, link checks, and a clean-repository reproduction check.
 - [ ] Request final adversarial reviews for GitHub product fit, statistical validity, and technical reproducibility; fix every critical/important issue.
 - [ ] Push the verified report and record final commit SHA and public repository URL.
-

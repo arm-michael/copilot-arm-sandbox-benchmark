@@ -1,0 +1,4 @@
+# Retained runner artifacts are committed byte-for-byte, including tool-emitted
+# whitespace. CSV uses the format's standard CRLF record terminator.
+results/*/raw/** -whitespace
+*.csv whitespace=cr-at-eol

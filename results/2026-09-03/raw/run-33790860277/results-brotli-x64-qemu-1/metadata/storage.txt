@@ -1,0 +1,9 @@
+Filesystem        1B-blocks        Used   Available Use% Mounted on
+/dev/root      154894188544 62420144128 92457267200  41% /
+tmpfs            8385372160       86016  8385286144   1% /dev/shm
+tmpfs            3354148864     1044480  3353104384   1% /run
+tmpfs               5242880           0     5242880   0% /run/lock
+efivarfs          134217728       26054   134186554   1% /sys/firmware/efi/efivars
+/dev/sda16        923156480    66564096   791949312   8% /boot
+/dev/sda15        109395456     6399488   102995968   6% /boot/efi
+tmpfs            1677074432       12288  1677062144   1% /run/user/1001

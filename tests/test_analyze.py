@@ -55,6 +55,27 @@ def record(
     }
 
 
+def lifecycle_records(
+    block,
+    mode,
+    expected_repetitions=1,
+    workload="brotli",
+    git_sha="abc123",
+):
+    return [
+        record(
+            block,
+            mode,
+            0,
+            expected_repetitions=expected_repetitions,
+            workload=workload,
+            phase=phase,
+            git_sha=git_sha,
+        )
+        for phase in ("attempt", "verification")
+    ]
+
+
 class AnalysisTests(unittest.TestCase):
     def sample_records(self):
         records = [
@@ -130,12 +151,10 @@ class AnalysisTests(unittest.TestCase):
         for block in ("block-1", "block-2"):
             expected_repetitions = 3 if block == "block-1" else 1
             for mode in ("emulated", "native"):
-                records.append(
-                    record(
+                records.extend(
+                    lifecycle_records(
                         block,
                         mode,
-                        0,
-                        phase="verification",
                         expected_repetitions=expected_repetitions,
                     )
                 )
@@ -209,6 +228,20 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(pairs, [])
         self.assertIn("missing native post-timing verification", exclusions[0]["reason"])
+
+    def test_pair_without_both_pre_checkout_attempt_records_is_excluded(self):
+        records = [
+            record("missing-attempt", "emulated", 10),
+            record("missing-attempt", "native", 2),
+            record("missing-attempt", "emulated", 0, phase="attempt"),
+            record("missing-attempt", "emulated", 0, phase="verification"),
+            record("missing-attempt", "native", 0, phase="verification"),
+        ]
+
+        pairs, exclusions = pairing_analysis(records)
+
+        self.assertEqual(pairs, [])
+        self.assertIn("missing native attempt record", exclusions[0]["reason"])
 
     def test_pair_requires_one_shared_nonempty_harness_sha(self):
         records = [
@@ -307,6 +340,45 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("duplicate emulated", duplicate_exclusions[0]["reason"])
         self.assertIn("verification repetition count", count_exclusions[0]["reason"])
 
+    def test_analysis_rejects_aggregation_across_harness_commits(self):
+        records = []
+        for block, git_sha in (("first", "aaa"), ("second", "bbb")):
+            records.extend(
+                [
+                    record(block, "emulated", 10, git_sha=git_sha),
+                    record(block, "native", 2, git_sha=git_sha),
+                ]
+            )
+            for mode in ("emulated", "native"):
+                records.extend(lifecycle_records(block, mode, git_sha=git_sha))
+
+        with self.assertRaisesRegex(ValueError, "multiple harness git_sha"):
+            pairing_analysis(records)
+
+    def test_analysis_requires_the_declared_frozen_harness_commit(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "expected retained records at harness git_sha frozen",
+        ):
+            pairing_analysis(self.sample_records(), expected_git_sha="frozen")
+
+    def test_declared_harness_commit_covers_excluded_retained_records(self):
+        records = self.sample_records()
+        records.append(
+            record(
+                "wrong-sha-incomplete",
+                "native",
+                2,
+                git_sha="unexpected",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "expected retained records at harness git_sha abc123.*unexpected",
+        ):
+            pairing_analysis(records, expected_git_sha="abc123")
+
     def test_incomplete_or_malformed_schema_is_rejected(self):
         missing_command = record("bad", "native", 1)
         missing_command.pop("command")
@@ -328,6 +400,9 @@ class AnalysisTests(unittest.TestCase):
         self.assertLessEqual(first[0], 4.5)
         self.assertGreaterEqual(first[1], 4.5)
 
+        with self.assertRaisesRegex(ValueError, "positive"):
+            bootstrap_ci([4.0, 5.0], samples=0)
+
     def test_multiple_workloads_remain_in_one_well_formed_summary_table(self):
         records = self.sample_records() + [
             record("python-block", "emulated", 30, workload="cpython"),
@@ -347,10 +422,20 @@ class AnalysisTests(unittest.TestCase):
                 phase="verification",
             ),
         ]
+        for mode in ("emulated", "native"):
+            records.append(
+                record(
+                    "python-block",
+                    mode,
+                    0,
+                    workload="cpython",
+                    phase="attempt",
+                )
+            )
 
         report = render_markdown(records, bootstrap_samples=200)
 
-        self.assertLess(report.index("| Cpython |"), report.index("Observed paired"))
+        self.assertLess(report.index("| CPython |"), report.index("Observed paired"))
 
 
 class AnalysisCliTests(unittest.TestCase):
@@ -382,6 +467,8 @@ class AnalysisCliTests(unittest.TestCase):
                     str(pairs_csv),
                     "--bootstrap-samples",
                     "2000",
+                    "--expected-git-sha",
+                    "abc123",
                 ],
                 cwd=ROOT,
                 text=True,
@@ -394,13 +481,17 @@ class AnalysisCliTests(unittest.TestCase):
             report = markdown.read_text(encoding="utf-8")
             self.assertIn("Brotli", report)
             self.assertIn("2 paired blocks", report)
+            self.assertIn("2/2", report)
             self.assertIn("Median x64 + QEMU", report)
             self.assertIn("Median native ARM64", report)
+            self.assertIn("Exploratory paired bootstrap 95% interval", report)
             self.assertIn("16.00 s", report)
             self.assertIn("3.50 s", report)
             self.assertIn("4.50x", report)
             self.assertIn("4.47x", report)
             self.assertIn("4.00x–5.00x", report)
+            self.assertIn("Harness commit: `abc123`", report)
+            self.assertIn("marginal medians", report)
             self.assertIn("Excluded primary blocks", report)
             self.assertIn("Intended treatment attempts", report)
             with output_csv.open(newline="", encoding="utf-8") as stream:
