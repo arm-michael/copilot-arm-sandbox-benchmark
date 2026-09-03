@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+workloads/brotli/brotli.tar.gz
+workloads/cpython/cpython.tgz
+

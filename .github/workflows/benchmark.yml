@@ -1,0 +1,197 @@
+name: Paired ARM64 benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: Workload to run
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - brotli
+          - cpython
+          - all
+      repetitions:
+        description: Timed repetitions per fresh VM
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: ${{ matrix.workload }} / ${{ matrix.treatment.name }}
+    runs-on: ${{ matrix.treatment.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        treatment:
+          - name: x64-qemu
+            runner: ubuntu-24.04
+            host_arch: amd64
+          - name: arm64-native
+            runner: ubuntu-24.04-arm
+            host_arch: arm64
+        workload: ${{ fromJSON(inputs.workload == 'all' && '["brotli","cpython"]' || format('["{0}"]', inputs.workload)) }}
+    env:
+      TARGET_PLATFORM: linux/arm64
+      RESULT_FILE: results/${{ matrix.workload }}-${{ matrix.treatment.name }}.jsonl
+
+    steps:
+      - name: Check out the benchmark
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate inputs and capture host metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${{ inputs.repetitions }}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "repetitions must be a positive integer" >&2
+            exit 2
+          fi
+          test "$(nproc)" -eq 4
+          expected_uname=x86_64
+          if [[ "${{ matrix.treatment.host_arch }}" == arm64 ]]; then
+            expected_uname=aarch64
+          fi
+          test "$(uname -m)" = "${expected_uname}"
+          mkdir -p metadata results
+          uname -a > metadata/uname.txt
+          lscpu -J > metadata/lscpu.json
+          cat /proc/cpuinfo > metadata/cpuinfo.txt
+          free -b > metadata/memory.txt
+          df -B1 > metadata/storage.txt
+          {
+            printf 'runner_label=%s\n' '${{ matrix.treatment.runner }}'
+            printf 'treatment=%s\n' '${{ matrix.treatment.name }}'
+            printf 'target_platform=%s\n' "${TARGET_PLATFORM}"
+            printf 'image_os=%s\n' "${ImageOS:-}"
+            printf 'image_version=%s\n' "${ImageVersion:-}"
+            printf 'workflow_run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'workflow_run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'git_sha=%s\n' "${GITHUB_SHA}"
+          } > metadata/runner.txt
+          docker version > metadata/docker-version.txt
+
+      - name: Set up QEMU for ARM64 target execution
+        id: qemu
+        if: matrix.treatment.name == 'x64-qemu'
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          image: docker.io/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          driver: docker-container
+
+      - name: Verify target execution and capture tool metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx version | tee metadata/buildx-version.txt
+          docker buildx inspect '${{ steps.buildx.outputs.name }}' --bootstrap | tee metadata/buildx-inspect.txt
+          target_uname=$(docker run --rm --platform "${TARGET_PLATFORM}" alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce uname -m)
+          test "${target_uname}" = aarch64
+          printf '%s\n' "${target_uname}" > metadata/target-uname.txt
+          if [[ '${{ matrix.treatment.name }}' == x64-qemu ]]; then
+            test -f /proc/sys/fs/binfmt_misc/qemu-aarch64
+            grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
+            cp /proc/sys/fs/binfmt_misc/qemu-aarch64 metadata/qemu-aarch64-binfmt.txt
+          fi
+
+      - name: Measure target execution smoke test
+        if: matrix.workload == 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/measure.py \
+            --output "${RESULT_FILE}" \
+            --workload smoke \
+            --phase target-execution \
+            --repetition 1 \
+            --runner-label '${{ matrix.treatment.runner }}' \
+            --host-arch '${{ matrix.treatment.host_arch }}' \
+            --target-arch arm64 \
+            -- docker run --rm --platform "${TARGET_PLATFORM}" \
+              alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+              sh -c 'test "$(uname -m)" = aarch64 && dd if=/dev/zero bs=1M count=64 2>/dev/null | sha256sum'
+
+      - name: Fetch and verify the pinned source fixture
+        if: matrix.workload != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/fetch_fixture.py '${{ matrix.workload }}' 'workloads/${{ matrix.workload }}'
+
+      - name: Prepare pinned target-platform base and source layers
+        if: matrix.workload != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/measure.py \
+            --output "${RESULT_FILE}" \
+            --workload '${{ matrix.workload }}' \
+            --phase prepare \
+            --repetition 1 \
+            --runner-label '${{ matrix.treatment.runner }}' \
+            --host-arch '${{ matrix.treatment.host_arch }}' \
+            --target-arch arm64 \
+            -- docker buildx build \
+              --builder '${{ steps.buildx.outputs.name }}' \
+              --platform "${TARGET_PLATFORM}" \
+              --target prepared \
+              --provenance=false \
+              --sbom=false \
+              --output type=cacheonly \
+              --progress plain \
+              'workloads/${{ matrix.workload }}'
+
+      - name: Measure compile, native tests, and compression
+        id: measure
+        if: matrix.workload != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repetition in $(seq 1 '${{ inputs.repetitions }}'); do
+            python3 scripts/measure.py \
+              --output "${RESULT_FILE}" \
+              --workload '${{ matrix.workload }}' \
+              --phase build-test \
+              --repetition "${repetition}" \
+              --runner-label '${{ matrix.treatment.runner }}' \
+              --host-arch '${{ matrix.treatment.host_arch }}' \
+              --target-arch arm64 \
+              -- docker buildx build \
+                --builder '${{ steps.buildx.outputs.name }}' \
+                --platform "${TARGET_PLATFORM}" \
+                --target benchmark \
+                --build-arg "BENCHMARK_ITERATION=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${repetition}" \
+                --provenance=false \
+                --sbom=false \
+                --output type=cacheonly \
+                --progress plain \
+                'workloads/${{ matrix.workload }}'
+          done
+
+      - name: Upload raw measurements and metadata
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: results-${{ matrix.workload }}-${{ matrix.treatment.name }}-${{ github.run_attempt }}
+          path: |
+            results/
+            metadata/
+          if-no-files-found: error
+          retention-days: 30
+
