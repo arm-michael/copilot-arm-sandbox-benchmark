@@ -177,6 +177,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Expansion is intentionally delayed until sh runs inside the container.
+          # shellcheck disable=SC2016
           python3 scripts/measure.py \
             --output "${RESULT_FILE}" \
             --workload smoke \

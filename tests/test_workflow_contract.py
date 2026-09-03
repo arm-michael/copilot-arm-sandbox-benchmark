@@ -143,6 +143,21 @@ class WorkflowContractTests(unittest.TestCase):
             commands,
         )
 
+    def test_container_shell_expansion_has_scoped_shellcheck_suppression(self):
+        workflow_text = WORKFLOW.read_text()
+        inner_shell_command = (
+            "sh -c 'test \"$(uname -m)\" = aarch64 && "
+            "dd if=/dev/zero bs=1M count=64 2>/dev/null | sha256sum'"
+        )
+
+        self.assertIn(
+            "# Expansion is intentionally delayed until sh runs inside the container.\n"
+            "          # shellcheck disable=SC2016\n"
+            "          python3 scripts/measure.py",
+            workflow_text,
+        )
+        self.assertIn(inner_shell_command, workflow_text)
+
 
 if __name__ == "__main__":
     unittest.main()
