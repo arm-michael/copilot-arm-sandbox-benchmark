@@ -1,0 +1,15 @@
+{
+  "brotli": {
+    "filename": "brotli.tar.gz",
+    "sha256": "0afe09a53c8bad9861c8dd1fc1284308d54f19d2979ba3541cfdcc9b05fe360f",
+    "source_revision": "028fb5a23661f123017c060daa546b55cf4bde29",
+    "url": "https://codeload.github.com/google/brotli/tar.gz/028fb5a23661f123017c060daa546b55cf4bde29"
+  },
+  "cpython": {
+    "filename": "cpython.tgz",
+    "sha256": "62859805f6fdf25e2bcbf3fa3217801e1996887ca33e6a2af80674bdfa2dbe07",
+    "source_revision": "v3.14.7",
+    "url": "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz"
+  }
+}
+
