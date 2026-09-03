@@ -75,7 +75,7 @@ def main(argv=None):
     elapsed_seconds = (time.perf_counter_ns() - started_ns) / 1_000_000_000
 
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "block_id": "{}.{}".format(run_id, run_attempt),
         "workload": args.workload,
         "phase": args.phase,

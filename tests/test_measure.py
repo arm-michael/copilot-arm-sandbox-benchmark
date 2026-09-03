@@ -118,7 +118,7 @@ class MeasurementCliTests(unittest.TestCase):
                 },
             )
             expected_values = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "block_id": "12345.2",
                 "workload": "smoke",
                 "phase": "target-execution",

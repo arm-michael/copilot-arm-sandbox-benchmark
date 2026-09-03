@@ -6,7 +6,13 @@ import sys
 import tempfile
 import unittest
 
-from scripts.analyze import bootstrap_ci, paired_speedups, render_markdown, vm_medians
+from scripts.analyze import (
+    bootstrap_ci,
+    paired_speedups,
+    pairing_analysis,
+    render_markdown,
+    vm_medians,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +31,7 @@ def record(
     phase="build-test",
 ):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "block_id": block,
         "workload": workload,
         "phase": phase,
@@ -106,6 +112,12 @@ class AnalysisTests(unittest.TestCase):
                 1,
                 expected_repetitions=2,
             ),
+            record("never-built", "emulated", 0, phase="attempt"),
+            record("never-built", "native", 0, phase="attempt"),
+            record("fetch-failed", "emulated", 0, phase="attempt"),
+            record("fetch-failed", "native", 0, phase="attempt"),
+            record("fetch-failed", "emulated", 1, exit_code=6, phase="fetch"),
+            record("fetch-failed", "native", 1, phase="fetch"),
             record(
                 "mismatched-count",
                 "native",
@@ -148,6 +160,27 @@ class AnalysisTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "runner_label"):
             vm_medians([bad])
+
+    def test_attempts_that_never_reach_primary_timing_are_excluded_with_setup_failures(self):
+        pairs, exclusions = pairing_analysis(self.sample_records())
+        reasons = {row["block_id"]: row["reason"] for row in exclusions}
+
+        self.assertEqual(len(pairs), 2)
+        self.assertIn("never-built", reasons)
+        self.assertIn("missing valid treatment", reasons["never-built"])
+        self.assertIn("fetch-failed", reasons)
+        self.assertIn("emulated fetch failure", reasons["fetch-failed"])
+
+    def test_incomplete_or_malformed_schema_is_rejected(self):
+        missing_command = record("bad", "native", 1)
+        missing_command.pop("command")
+        invalid_elapsed = record("bad", "native", 1)
+        invalid_elapsed["elapsed_seconds"] = "fast"
+
+        with self.assertRaisesRegex(ValueError, "command"):
+            vm_medians([missing_command])
+        with self.assertRaisesRegex(ValueError, "elapsed_seconds"):
+            vm_medians([invalid_elapsed])
 
     def test_bootstrap_interval_is_deterministic_and_contains_the_median(self):
         first = bootstrap_ci([4.0, 5.0], samples=2000, seed=20260903)
@@ -215,6 +248,7 @@ class AnalysisCliTests(unittest.TestCase):
             self.assertIn("4.47x", report)
             self.assertIn("4.00x–5.00x", report)
             self.assertIn("Excluded primary blocks", report)
+            self.assertIn("Intended treatment attempts", report)
             with output_csv.open(newline="", encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), len(records))

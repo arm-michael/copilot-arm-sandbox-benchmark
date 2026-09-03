@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Check out the benchmark
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
 
       - name: Run unit and contract tests
         run: python3 -m unittest discover -s tests -v
@@ -33,4 +35,3 @@ jobs:
             "${archive}" | sha256sum --check --strict
           tar -xzf "${archive}" -C "${RUNNER_TEMP}" actionlint
           "${RUNNER_TEMP}/actionlint" .github/workflows/ci.yml .github/workflows/benchmark.yml
-

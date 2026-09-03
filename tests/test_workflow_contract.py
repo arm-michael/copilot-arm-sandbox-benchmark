@@ -113,12 +113,29 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("job-elapsed-seconds", finalize["run"])
         self.assertIn("binfmt-version", finalize["run"])
 
+    def test_every_treatment_records_intent_before_checkout_and_measures_fixture_fetch(self):
+        workflow = load_workflow()
+        steps = workflow["jobs"]["benchmark"]["steps"]
+        attempt = next(step for step in steps if step.get("id") == "attempt")
+        fetch = next(step for step in steps if step.get("id") == "fetch")
+        finalize = next(step for step in steps if step.get("id") == "finalize")
+
+        self.assertLess(steps.index(attempt), 1)
+        self.assertIn('"schema_version": 2', attempt["run"])
+        self.assertIn('"phase": "attempt"', attempt["run"])
+        self.assertIn("benchmark-attempt.jsonl", attempt["run"])
+        self.assertIn("--phase fetch", fetch["run"])
+        self.assertIn("scripts/measure.py", fetch["run"])
+        self.assertIn("benchmark-attempt.jsonl", finalize["run"])
+
     def test_ci_runs_unit_tests_and_checksum_pinned_actionlint(self):
         workflow = load_yaml(CI_WORKFLOW)
         job = workflow["jobs"]["checks"]
         commands = "\n".join(step.get("run", "") for step in job["steps"])
+        checkout = next(step for step in job["steps"] if "uses" in step)
 
         self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        self.assertEqual(checkout["with"]["fetch-depth"], 2)
         self.assertIn("python3 -m unittest discover -s tests -v", commands)
         self.assertIn("actionlint_1.7.12_linux_amd64.tar.gz", commands)
         self.assertIn(

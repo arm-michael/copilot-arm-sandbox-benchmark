@@ -68,6 +68,16 @@ class DockerfileContractTests(unittest.TestCase):
         self.assertIn("make -j 4", cpython)
         self.assertIn("-m test -j 4", cpython)
 
+    def test_failing_test_output_is_printed_before_the_build_propagates_failure(self):
+        for workload in ("brotli", "cpython"):
+            with self.subTest(workload=workload):
+                dockerfile = self.dockerfile(workload)
+                capture = dockerfile.index("|| test_status=$?")
+                printed = dockerfile.index("cat /evidence/tests.txt", capture)
+                propagated = dockerfile.index('test "${test_status}" -eq 0', printed)
+                self.assertLess(capture, printed)
+                self.assertLess(printed, propagated)
+
 
 if __name__ == "__main__":
     unittest.main()

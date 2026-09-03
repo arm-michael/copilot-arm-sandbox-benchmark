@@ -51,12 +51,54 @@ jobs:
       RESULT_FILE: results/${{ matrix.workload }}-${{ matrix.treatment.name }}.jsonl
       REPETITIONS: ${{ inputs.repetitions }}
       TRIAL_CLASS: ${{ inputs.trial_class }}
+      BENCH_WORKLOAD: ${{ matrix.workload }}
+      BENCH_RUNNER_LABEL: ${{ matrix.treatment.runner }}
+      BENCH_HOST_ARCH: ${{ matrix.treatment.host_arch }}
 
     steps:
-      - name: Start end-to-end job timer
+      - name: Record treatment intent and start end-to-end job timer
+        id: attempt
         shell: bash
         run: |
+          set -euo pipefail
           date +%s%N > "${RUNNER_TEMP}/benchmark-job-start-ns"
+          date -u +%Y-%m-%dT%H:%M:%S.%NZ > "${RUNNER_TEMP}/benchmark-job-started-at"
+          python3 - > "${RUNNER_TEMP}/benchmark-attempt.jsonl" <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+
+          try:
+              expected_repetitions = int(os.environ["REPETITIONS"])
+              if expected_repetitions < 1:
+                  expected_repetitions = 1
+          except ValueError:
+              expected_repetitions = 1
+          host_arch = os.environ["BENCH_HOST_ARCH"]
+          record = {
+              "schema_version": 2,
+              "block_id": "{}.{}".format(
+                  os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+              ),
+              "workload": os.environ["BENCH_WORKLOAD"],
+              "phase": "attempt",
+              "repetition": 1,
+              "expected_repetitions": expected_repetitions,
+              "trial_class": os.environ["TRIAL_CLASS"],
+              "runner_label": os.environ["BENCH_RUNNER_LABEL"],
+              "host_arch": host_arch,
+              "target_arch": "arm64",
+              "execution_mode": "native" if host_arch == "arm64" else "emulated",
+              "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "elapsed_seconds": 0.0,
+              "exit_code": 0,
+              "command": [],
+              "git_sha": os.environ.get("GITHUB_SHA", ""),
+              "runner_image_os": os.environ.get("ImageOS", ""),
+              "runner_image_version": os.environ.get("ImageVersion", ""),
+          }
+          print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+          PY
 
       - name: Check out the benchmark
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,7 +120,7 @@ jobs:
           test "$(uname -m)" = "${expected_uname}"
           mkdir -p metadata results
           cp "${RUNNER_TEMP}/benchmark-job-start-ns" metadata/job-start-ns.txt
-          date -u +%Y-%m-%dT%H:%M:%S.%NZ > metadata/job-started-at.txt
+          cp "${RUNNER_TEMP}/benchmark-job-started-at" metadata/job-started-at.txt
           uname -a > metadata/uname.txt
           lscpu -J > metadata/lscpu.json
           cat /proc/cpuinfo > metadata/cpuinfo.txt
@@ -150,10 +192,22 @@ jobs:
               sh -c 'test "$(uname -m)" = aarch64 && dd if=/dev/zero bs=1M count=64 2>/dev/null | sha256sum'
 
       - name: Fetch and verify the pinned source fixture
+        id: fetch
         if: matrix.workload != 'smoke'
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/measure.py \
+            --output "${RESULT_FILE}" \
+            --workload '${{ matrix.workload }}' \
+            --phase fetch \
+            --repetition 1 \
+            --expected-repetitions 1 \
+            --trial-class "${TRIAL_CLASS}" \
+            --runner-label '${{ matrix.treatment.runner }}' \
+            --host-arch '${{ matrix.treatment.host_arch }}' \
+            --target-arch arm64 \
+            -- python3 scripts/fetch_fixture.py '${{ matrix.workload }}' 'workloads/${{ matrix.workload }}'
           fixture_path=$(python3 scripts/fetch_fixture.py '${{ matrix.workload }}' 'workloads/${{ matrix.workload }}')
           printf '%s\n' "${fixture_path}"
           sha256sum "${fixture_path}" > metadata/fixture-sha256.txt
@@ -237,6 +291,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p metadata results evidence
+          if [[ -f "${RUNNER_TEMP}/benchmark-attempt.jsonl" ]]; then
+            cp "${RUNNER_TEMP}/benchmark-attempt.jsonl" \
+              "results/attempt-${BENCH_WORKLOAD}-${{ matrix.treatment.name }}.jsonl"
+          fi
           end_ns=$(date +%s%N)
           printf '%s\n' "${end_ns}" > metadata/job-end-ns.txt
           date -u +%Y-%m-%dT%H:%M:%S.%NZ > metadata/job-ended-at.txt

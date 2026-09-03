@@ -23,8 +23,13 @@ REQUIRED_FIELDS = {
     "host_arch",
     "target_arch",
     "execution_mode",
+    "started_at",
     "elapsed_seconds",
     "exit_code",
+    "command",
+    "git_sha",
+    "runner_image_os",
+    "runner_image_version",
 }
 
 TREATMENTS = {
@@ -60,8 +65,51 @@ def validate_record(row):
     missing = sorted(REQUIRED_FIELDS - set(row))
     if missing:
         raise ValueError("record is missing required fields: {}".format(", ".join(missing)))
-    if row["schema_version"] != 1:
+    if row["schema_version"] != 2:
         raise ValueError("unsupported schema_version: {}".format(row["schema_version"]))
+    string_fields = (
+        "block_id",
+        "workload",
+        "phase",
+        "trial_class",
+        "runner_label",
+        "host_arch",
+        "target_arch",
+        "execution_mode",
+        "started_at",
+        "git_sha",
+        "runner_image_os",
+        "runner_image_version",
+    )
+    for field in string_fields:
+        if not isinstance(row[field], str):
+            raise ValueError("{} must be a string".format(field))
+    for field in (
+        "block_id",
+        "workload",
+        "phase",
+        "runner_label",
+        "host_arch",
+        "target_arch",
+        "execution_mode",
+        "started_at",
+    ):
+        if not row[field]:
+            raise ValueError("{} must not be empty".format(field))
+    elapsed = row["elapsed_seconds"]
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(elapsed)
+        or elapsed < 0
+    ):
+        raise ValueError("elapsed_seconds must be a finite non-negative number")
+    if isinstance(row["exit_code"], bool) or not isinstance(row["exit_code"], int):
+        raise ValueError("exit_code must be an integer")
+    if not isinstance(row["command"], list) or not all(
+        isinstance(part, str) for part in row["command"]
+    ):
+        raise ValueError("command must be a list of strings")
     if row["trial_class"] not in {"pilot", "retained"}:
         raise ValueError("invalid trial_class: {}".format(row["trial_class"]))
     if row["target_arch"] != "arm64":
@@ -81,6 +129,8 @@ def validate_record(row):
         raise ValueError("expected_repetitions must be a positive integer")
     if not isinstance(row["repetition"], int) or row["repetition"] < 1:
         raise ValueError("repetition must be a positive integer")
+    if row["repetition"] > row["expected_repetitions"]:
+        raise ValueError("repetition exceeds expected_repetitions")
 
 
 def primary_records(records):
@@ -154,6 +204,24 @@ def pairing_analysis(records):
         (row["block_id"], row["workload"], row["phase"])
         for row in primary_records(records)
     }
+    primary_keys.update(
+        (row["block_id"], row["workload"], "build-test")
+        for row in records
+        if row["trial_class"] == "retained" and row["phase"] == "attempt"
+    )
+    setup_failures = {}
+    for row in records:
+        if (
+            row["trial_class"] == "retained"
+            and row["phase"] not in {"attempt", "build-test"}
+            and row["exit_code"] != 0
+        ):
+            key = (row["block_id"], row["workload"], "build-test")
+            setup_failures.setdefault(key, []).append(
+                "{} {} failure (exit {})".format(
+                    row["execution_mode"], row["phase"], row["exit_code"]
+                )
+            )
     pairs = []
     exclusions = []
     for block_id, workload, phase in sorted(primary_keys):
@@ -165,6 +233,7 @@ def pairing_analysis(records):
             )
             if (error_block, error_workload, error_phase) == pair_key
         ]
+        relevant_errors.extend(sorted(setup_failures.get(pair_key, [])))
         modes = treatments.get(pair_key, {})
         missing_modes = sorted({"emulated", "native"} - set(modes))
         if relevant_errors or missing_modes:
@@ -294,6 +363,15 @@ def render_markdown(records, bootstrap_samples):
         lines.extend([""] + range_lines)
     primary = list(primary_records(records))
     successful = sum(row["exit_code"] == 0 for row in primary)
+    attempts = [
+        row
+        for row in records
+        if row["trial_class"] == "retained" and row["phase"] == "attempt"
+    ]
+    reached_primary = {
+        (row["block_id"], row["workload"], row["execution_mode"])
+        for row in primary
+    }
     lines.extend(
         [
             "",
@@ -301,6 +379,9 @@ def render_markdown(records, bootstrap_samples):
                 successful,
                 len(primary),
                 100 * successful / len(primary) if primary else 0.0,
+            ),
+            "Intended treatment attempts: {}; treatments reaching primary timing: {}.".format(
+                len(attempts), len(reached_primary)
             ),
             "",
             "Excluded primary blocks: {}.".format(len(exclusions)),
