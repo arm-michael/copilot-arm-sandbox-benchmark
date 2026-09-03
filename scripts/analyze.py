@@ -11,6 +11,28 @@ import statistics
 import sys
 
 
+REQUIRED_FIELDS = {
+    "schema_version",
+    "block_id",
+    "workload",
+    "phase",
+    "repetition",
+    "expected_repetitions",
+    "trial_class",
+    "runner_label",
+    "host_arch",
+    "target_arch",
+    "execution_mode",
+    "elapsed_seconds",
+    "exit_code",
+}
+
+TREATMENTS = {
+    "emulated": {"runner_label": "ubuntu-24.04", "host_arch": "amd64"},
+    "native": {"runner_label": "ubuntu-24.04-arm", "host_arch": "arm64"},
+}
+
+
 def load_records(paths):
     records = []
     files = []
@@ -34,14 +56,44 @@ def load_records(paths):
     return records
 
 
-def vm_medians(records):
-    groups = {}
+def validate_record(row):
+    missing = sorted(REQUIRED_FIELDS - set(row))
+    if missing:
+        raise ValueError("record is missing required fields: {}".format(", ".join(missing)))
+    if row["schema_version"] != 1:
+        raise ValueError("unsupported schema_version: {}".format(row["schema_version"]))
+    if row["trial_class"] not in {"pilot", "retained"}:
+        raise ValueError("invalid trial_class: {}".format(row["trial_class"]))
+    if row["target_arch"] != "arm64":
+        raise ValueError("target_arch must be arm64")
+    mode = row["execution_mode"]
+    if mode not in TREATMENTS:
+        raise ValueError("invalid execution_mode: {}".format(mode))
+    expected = TREATMENTS[mode]
+    for field, value in expected.items():
+        if row[field] != value:
+            raise ValueError(
+                "{} for {} treatment must be {!r}, got {!r}".format(
+                    field, mode, value, row[field]
+                )
+            )
+    if not isinstance(row["expected_repetitions"], int) or row["expected_repetitions"] < 1:
+        raise ValueError("expected_repetitions must be a positive integer")
+    if not isinstance(row["repetition"], int) or row["repetition"] < 1:
+        raise ValueError("repetition must be a positive integer")
+
+
+def primary_records(records):
     for row in records:
-        if row.get("target_arch") != "arm64":
-            continue
-        mode = row.get("execution_mode")
-        if mode not in {"native", "emulated"}:
-            continue
+        validate_record(row)
+        if row["trial_class"] == "retained" and row["phase"] == "build-test":
+            yield row
+
+
+def vm_analysis(records):
+    groups = {}
+    for row in primary_records(records):
+        mode = row["execution_mode"]
         key = (
             row["block_id"],
             row["workload"],
@@ -51,8 +103,24 @@ def vm_medians(records):
         groups.setdefault(key, []).append(row)
 
     medians = []
+    errors = {}
     for (block_id, workload, phase, mode), rows in sorted(groups.items()):
+        key = (block_id, workload, phase, mode)
+        expected_counts = {row["expected_repetitions"] for row in rows}
+        repetitions = [row["repetition"] for row in rows]
+        reasons = []
+        if len(expected_counts) != 1:
+            reasons.append("inconsistent expected_repetitions")
+        if len(repetitions) != len(set(repetitions)):
+            reasons.append("duplicate repetition")
+        if len(expected_counts) == 1:
+            expected = next(iter(expected_counts))
+            if set(repetitions) != set(range(1, expected + 1)):
+                reasons.append("missing or unexpected repetition")
         if any(row.get("exit_code") != 0 for row in rows):
+            reasons.append("measured command failure")
+        if reasons:
+            errors[key] = "; ".join(reasons)
             continue
         seconds = [float(row["elapsed_seconds"]) for row in rows]
         medians.append(
@@ -63,24 +131,81 @@ def vm_medians(records):
                 "execution_mode": mode,
                 "elapsed_seconds": statistics.median(seconds),
                 "repetitions": len(seconds),
+                "expected_repetitions": next(iter(expected_counts)),
             }
         )
+    return medians, errors
+
+
+def vm_medians(records):
+    medians, _ = vm_analysis(records)
     return medians
 
 
-def paired_speedups(records):
+def pairing_analysis(records):
+    records = list(records)
+    medians, group_errors = vm_analysis(records)
     treatments = {}
-    for row in vm_medians(records):
+    for row in medians:
         key = (row["block_id"], row["workload"], row["phase"])
         treatments.setdefault(key, {})[row["execution_mode"]] = row
 
+    primary_keys = {
+        (row["block_id"], row["workload"], row["phase"])
+        for row in primary_records(records)
+    }
     pairs = []
-    for (block_id, workload, phase), modes in sorted(treatments.items()):
-        if set(modes) != {"emulated", "native"}:
+    exclusions = []
+    for block_id, workload, phase in sorted(primary_keys):
+        pair_key = (block_id, workload, phase)
+        relevant_errors = [
+            "{}: {}".format(mode, reason)
+            for (error_block, error_workload, error_phase, mode), reason in sorted(
+                group_errors.items()
+            )
+            if (error_block, error_workload, error_phase) == pair_key
+        ]
+        modes = treatments.get(pair_key, {})
+        missing_modes = sorted({"emulated", "native"} - set(modes))
+        if relevant_errors or missing_modes:
+            reasons = relevant_errors
+            if missing_modes:
+                reasons.append("missing valid treatment: {}".format(", ".join(missing_modes)))
+            exclusions.append(
+                {
+                    "block_id": block_id,
+                    "workload": workload,
+                    "phase": phase,
+                    "reason": "; ".join(reasons),
+                }
+            )
             continue
+
+        if (
+            modes["emulated"]["expected_repetitions"]
+            != modes["native"]["expected_repetitions"]
+        ):
+            exclusions.append(
+                {
+                    "block_id": block_id,
+                    "workload": workload,
+                    "phase": phase,
+                    "reason": "treatments declare different repetition counts",
+                }
+            )
+            continue
+
         emulated = modes["emulated"]["elapsed_seconds"]
         native = modes["native"]["elapsed_seconds"]
         if native <= 0:
+            exclusions.append(
+                {
+                    "block_id": block_id,
+                    "workload": workload,
+                    "phase": phase,
+                    "reason": "native median is not positive",
+                }
+            )
             continue
         pairs.append(
             {
@@ -92,6 +217,11 @@ def paired_speedups(records):
                 "speedup": emulated / native,
             }
         )
+    return pairs, exclusions
+
+
+def paired_speedups(records):
+    pairs, _ = pairing_analysis(records)
     return pairs
 
 
@@ -120,7 +250,8 @@ def bootstrap_ci(values, samples=10000, seed=20260903):
 
 
 def render_markdown(records, bootstrap_samples):
-    pairs = paired_speedups(records)
+    records = list(records)
+    pairs, exclusions = pairing_analysis(records)
     groups = {}
     for row in pairs:
         key = (row["workload"], row["phase"])
@@ -134,26 +265,64 @@ def render_markdown(records, bootstrap_samples):
         "| Workload | Phase | Paired observations | Median | Geometric mean | Paired bootstrap 95% CI |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
+    range_lines = []
     for (workload, phase), values in sorted(groups.items()):
         median = statistics.median(values)
         geometric_mean = math.exp(sum(math.log(value) for value in values) / len(values))
-        low, high = bootstrap_ci(values, samples=bootstrap_samples)
+        confidence_interval = "not estimated"
+        if len(values) >= 2:
+            low, high = bootstrap_ci(values, samples=bootstrap_samples)
+            confidence_interval = "{:.2f}x–{:.2f}x".format(low, high)
         lines.append(
-            "| {} | {} | {} paired blocks | {:.2f}x | {:.2f}x | {:.2f}x–{:.2f}x |".format(
+            "| {} | {} | {} paired blocks | {:.2f}x | {:.2f}x | {} |".format(
                 workload.replace("-", " ").title(),
                 phase.replace("-", " "),
                 len(values),
                 median,
                 geometric_mean,
-                low,
-                high,
+                confidence_interval,
+            )
+        )
+        range_lines.append(
+            "Observed paired speedup range for {}: {:.2f}x–{:.2f}x.".format(
+                workload.replace("-", " ").title(), min(values), max(values)
             )
         )
     if not groups:
         lines.append("| No complete pairs | — | 0 paired blocks | — | — | — |")
+    if range_lines:
+        lines.extend([""] + range_lines)
+    primary = list(primary_records(records))
+    successful = sum(row["exit_code"] == 0 for row in primary)
     lines.extend(
         [
             "",
+            "Primary measured-command success: {}/{} ({:.1f}%).".format(
+                successful,
+                len(primary),
+                100 * successful / len(primary) if primary else 0.0,
+            ),
+            "",
+            "Excluded primary blocks: {}.".format(len(exclusions)),
+            "",
+        ]
+    )
+    if exclusions:
+        lines.extend(
+            [
+                "| Excluded block | Workload | Reason |",
+                "| --- | --- | --- |",
+            ]
+        )
+        for row in exclusions:
+            lines.append(
+                "| {} | {} | {} |".format(
+                    row["block_id"], row["workload"], row["reason"]
+                )
+            )
+        lines.append("")
+    lines.extend(
+        [
             "Actions runners are a controlled proxy for Copilot cloud-agent sandboxes. CPU models differ, so these ratios compare the offered runner choices rather than isolating pure QEMU overhead.",
             "",
         ]
@@ -161,8 +330,10 @@ def render_markdown(records, bootstrap_samples):
     return "\n".join(lines)
 
 
-def write_csv(records, output):
+def write_csv(records, output, default_fields=None):
     fields = sorted({key for row in records for key in row})
+    if not fields:
+        fields = list(default_fields or [])
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -182,6 +353,7 @@ def parse_args(argv=None):
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--markdown", required=True, type=Path)
     parser.add_argument("--csv", required=True, type=Path)
+    parser.add_argument("--pairs-csv", required=True, type=Path)
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
     return parser.parse_args(argv)
 
@@ -194,11 +366,25 @@ def main(argv=None):
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
         args.markdown.write_text(report, encoding="utf-8")
         write_csv(records, args.csv)
+        pairs, _ = pairing_analysis(records)
+        write_csv(
+            pairs,
+            args.pairs_csv,
+            default_fields=(
+                "block_id",
+                "workload",
+                "phase",
+                "emulated_seconds",
+                "native_seconds",
+                "speedup",
+            ),
+        )
     except Exception as error:
         print("analyze: {}".format(error), file=sys.stderr)
         return 1
     print(args.markdown)
     print(args.csv)
+    print(args.pairs_csv)
     return 0
 
 

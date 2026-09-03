@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 
@@ -19,7 +21,21 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def fetch_fixture(manifest_path, workload, destination):
+def validate_fixture(fixture, allow_file_url=False):
+    checksum = str(fixture.get("sha256", ""))
+    if re.fullmatch(r"[0-9a-fA-F]{64}", checksum) is None:
+        raise ValueError("fixture SHA-256 must contain exactly 64 hexadecimal characters")
+    filename = str(fixture.get("filename", ""))
+    if not filename or filename in {".", ".."} or Path(filename).name != filename:
+        raise ValueError("fixture filename must be a simple filename without directories")
+    parsed_url = urlparse(str(fixture.get("url", "")))
+    if parsed_url.scheme == "file" and allow_file_url:
+        return
+    if parsed_url.scheme != "https" or not parsed_url.netloc:
+        raise ValueError("fixture URL must be an HTTPS URL")
+
+
+def fetch_fixture(manifest_path, workload, destination, allow_file_url=False):
     with manifest_path.open(encoding="utf-8") as stream:
         manifest = json.load(stream)
     if workload not in manifest:
@@ -31,6 +47,7 @@ def fetch_fixture(manifest_path, workload, destination):
         )
 
     fixture = manifest[workload]
+    validate_fixture(fixture, allow_file_url=allow_file_url)
     expected_sha = fixture["sha256"].lower()
     output = destination / fixture["filename"]
     destination.mkdir(parents=True, exist_ok=True)
@@ -76,6 +93,7 @@ def parse_args(argv=None):
         type=Path,
         default=Path(__file__).resolve().parents[1] / "workloads" / "fixtures.json",
     )
+    parser.add_argument("--allow-file-url", action="store_true")
     parser.add_argument("workload")
     parser.add_argument("destination", type=Path)
     return parser.parse_args(argv)
@@ -84,7 +102,12 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        output = fetch_fixture(args.manifest, args.workload, args.destination)
+        output = fetch_fixture(
+            args.manifest,
+            args.workload,
+            args.destination,
+            allow_file_url=args.allow_file_url,
+        )
     except Exception as error:
         print("fetch_fixture: {}".format(error), file=sys.stderr)
         return 1

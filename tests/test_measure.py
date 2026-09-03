@@ -61,6 +61,10 @@ class MeasurementCliTests(unittest.TestCase):
                 "target-execution",
                 "--repetition",
                 "2",
+                "--expected-repetitions",
+                "3",
+                "--trial-class",
+                "retained",
                 "--runner-label",
                 "ubuntu-24.04",
                 "--host-arch",
@@ -98,6 +102,8 @@ class MeasurementCliTests(unittest.TestCase):
                     "workload",
                     "phase",
                     "repetition",
+                    "expected_repetitions",
+                    "trial_class",
                     "runner_label",
                     "host_arch",
                     "target_arch",
@@ -117,6 +123,8 @@ class MeasurementCliTests(unittest.TestCase):
                 "workload": "smoke",
                 "phase": "target-execution",
                 "repetition": 2,
+                "expected_repetitions": 3,
+                "trial_class": "retained",
                 "runner_label": "ubuntu-24.04",
                 "host_arch": "amd64",
                 "target_arch": "arm64",
@@ -145,6 +153,55 @@ class MeasurementCliTests(unittest.TestCase):
             record = self.read_only_record(output)
             self.assertEqual(record["exit_code"], 7)
             self.assertEqual(record["execution_mode"], "emulated")
+
+    def test_repetition_outside_the_declared_trial_is_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "command-ran"
+            output = Path(directory) / "measurements.jsonl"
+            command = [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path({!r}).write_text('ran')".format(
+                    str(marker)
+                ),
+            ]
+            env = os.environ.copy()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(MEASURE),
+                    "--output",
+                    str(output),
+                    "--workload",
+                    "smoke",
+                    "--phase",
+                    "build-test",
+                    "--repetition",
+                    "3",
+                    "--expected-repetitions",
+                    "2",
+                    "--trial-class",
+                    "retained",
+                    "--runner-label",
+                    "ubuntu-24.04",
+                    "--host-arch",
+                    "x86_64",
+                    "--target-arch",
+                    "arm64",
+                    "--",
+                    *command,
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("repetition must be between 1 and 2", completed.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

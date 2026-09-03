@@ -30,13 +30,15 @@ class FetchFixtureCliTests(unittest.TestCase):
         )
         return manifest
 
-    def run_fetch(self, manifest, destination, workload="demo"):
+    def run_fetch(self, manifest, destination, workload="demo", allow_file=True):
+        options = ["--allow-file-url"] if allow_file else []
         return subprocess.run(
             [
                 sys.executable,
                 str(FETCH),
                 "--manifest",
                 str(manifest),
+                *options,
                 workload,
                 str(destination),
             ],
@@ -106,6 +108,58 @@ class FetchFixtureCliTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unknown workload 'missing'", completed.stderr)
             self.assertIn("demo", completed.stderr)
+
+    def test_non_https_remote_url_is_rejected_before_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "fixtures.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "demo": {
+                            "url": "http://example.invalid/source.tar.gz",
+                            "sha256": "0" * 64,
+                            "filename": "source.tar.gz",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = self.run_fetch(
+                manifest, root / "download", allow_file=False
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("HTTPS URL", completed.stderr)
+
+    def test_destination_filename_cannot_escape_its_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.write_bytes(b"source")
+            manifest = self.write_manifest(root, source)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["demo"]["filename"] = "../escaped.tar.gz"
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+            completed = self.run_fetch(manifest, root / "download")
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("simple filename", completed.stderr)
+            self.assertFalse((root / "escaped.tar.gz").exists())
+
+    def test_checksum_must_be_exactly_64_hexadecimal_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.write_bytes(b"source")
+            manifest = self.write_manifest(root, source, expected_sha="not-a-sha")
+
+            completed = self.run_fetch(manifest, root / "download")
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("64 hexadecimal", completed.stderr)
 
 
 if __name__ == "__main__":

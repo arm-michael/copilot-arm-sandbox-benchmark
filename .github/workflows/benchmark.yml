@@ -18,6 +18,14 @@ on:
         required: true
         default: "1"
         type: string
+      trial_class:
+        description: Pilot observations are retained but excluded from headline analysis
+        required: true
+        default: pilot
+        type: choice
+        options:
+          - pilot
+          - retained
 
 permissions:
   contents: read
@@ -41,8 +49,15 @@ jobs:
     env:
       TARGET_PLATFORM: linux/arm64
       RESULT_FILE: results/${{ matrix.workload }}-${{ matrix.treatment.name }}.jsonl
+      REPETITIONS: ${{ inputs.repetitions }}
+      TRIAL_CLASS: ${{ inputs.trial_class }}
 
     steps:
+      - name: Start end-to-end job timer
+        shell: bash
+        run: |
+          date +%s%N > "${RUNNER_TEMP}/benchmark-job-start-ns"
+
       - name: Check out the benchmark
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -51,7 +66,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "${{ inputs.repetitions }}" =~ ^[1-9][0-9]*$ ]]; then
+          if [[ ! "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]]; then
             echo "repetitions must be a positive integer" >&2
             exit 2
           fi
@@ -62,6 +77,8 @@ jobs:
           fi
           test "$(uname -m)" = "${expected_uname}"
           mkdir -p metadata results
+          cp "${RUNNER_TEMP}/benchmark-job-start-ns" metadata/job-start-ns.txt
+          date -u +%Y-%m-%dT%H:%M:%S.%NZ > metadata/job-started-at.txt
           uname -a > metadata/uname.txt
           lscpu -J > metadata/lscpu.json
           cat /proc/cpuinfo > metadata/cpuinfo.txt
@@ -93,6 +110,9 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           driver: docker-container
+          version: v0.37.0
+          driver-opts: |
+            image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
 
       - name: Verify target execution and capture tool metadata
         shell: bash
@@ -108,6 +128,7 @@ jobs:
             grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
             cp /proc/sys/fs/binfmt_misc/qemu-aarch64 metadata/qemu-aarch64-binfmt.txt
           fi
+          date +%s%N > metadata/setup-complete-ns.txt
 
       - name: Measure target execution smoke test
         if: matrix.workload == 'smoke'
@@ -119,6 +140,8 @@ jobs:
             --workload smoke \
             --phase target-execution \
             --repetition 1 \
+            --expected-repetitions 1 \
+            --trial-class "${TRIAL_CLASS}" \
             --runner-label '${{ matrix.treatment.runner }}' \
             --host-arch '${{ matrix.treatment.host_arch }}' \
             --target-arch arm64 \
@@ -131,7 +154,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/fetch_fixture.py '${{ matrix.workload }}' 'workloads/${{ matrix.workload }}'
+          fixture_path=$(python3 scripts/fetch_fixture.py '${{ matrix.workload }}' 'workloads/${{ matrix.workload }}')
+          printf '%s\n' "${fixture_path}"
+          sha256sum "${fixture_path}" > metadata/fixture-sha256.txt
 
       - name: Prepare pinned target-platform base and source layers
         if: matrix.workload != 'smoke'
@@ -143,6 +168,8 @@ jobs:
             --workload '${{ matrix.workload }}' \
             --phase prepare \
             --repetition 1 \
+            --expected-repetitions 1 \
+            --trial-class "${TRIAL_CLASS}" \
             --runner-label '${{ matrix.treatment.runner }}' \
             --host-arch '${{ matrix.treatment.host_arch }}' \
             --target-arch arm64 \
@@ -162,12 +189,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for repetition in $(seq 1 '${{ inputs.repetitions }}'); do
+          for repetition in $(seq 1 "${REPETITIONS}"); do
             python3 scripts/measure.py \
               --output "${RESULT_FILE}" \
               --workload '${{ matrix.workload }}' \
               --phase build-test \
               --repetition "${repetition}" \
+              --expected-repetitions "${REPETITIONS}" \
+              --trial-class "${TRIAL_CLASS}" \
               --runner-label '${{ matrix.treatment.runner }}' \
               --host-arch '${{ matrix.treatment.host_arch }}' \
               --target-arch arm64 \
@@ -183,6 +212,48 @@ jobs:
                 'workloads/${{ matrix.workload }}'
           done
 
+      - name: Export cached correctness evidence
+        id: evidence
+        if: matrix.workload != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p 'evidence/${{ matrix.workload }}'
+          docker buildx build \
+            --builder '${{ steps.buildx.outputs.name }}' \
+            --platform "${TARGET_PLATFORM}" \
+            --target evidence \
+            --build-arg "BENCHMARK_ITERATION=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${REPETITIONS}" \
+            --provenance=false \
+            --sbom=false \
+            --output type=local,dest='evidence/${{ matrix.workload }}' \
+            --progress plain \
+            'workloads/${{ matrix.workload }}'
+
+      - name: Finalize job and tool evidence
+        id: finalize
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metadata results evidence
+          end_ns=$(date +%s%N)
+          printf '%s\n' "${end_ns}" > metadata/job-end-ns.txt
+          date -u +%Y-%m-%dT%H:%M:%S.%NZ > metadata/job-ended-at.txt
+          start_ns=$(cat "${RUNNER_TEMP}/benchmark-job-start-ns")
+          python3 - "${start_ns}" "${end_ns}" > metadata/job-elapsed-seconds.txt <<'PY'
+          import sys
+          print((int(sys.argv[2]) - int(sys.argv[1])) / 1_000_000_000)
+          PY
+          if [[ '${{ matrix.treatment.name }}' == x64-qemu ]] && command -v docker >/dev/null; then
+            docker run --rm \
+              docker.io/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
+              --version > metadata/binfmt-version.txt 2>&1 \
+              || printf '%s\n' 'binfmt version command unavailable' > metadata/binfmt-version.txt
+          else
+            printf '%s\n' 'not used for native ARM64 treatment' > metadata/binfmt-version.txt
+          fi
+
       - name: Upload raw measurements and metadata
         id: upload
         if: always()
@@ -192,6 +263,6 @@ jobs:
           path: |
             results/
             metadata/
+            evidence/
           if-no-files-found: error
           retention-days: 30
-

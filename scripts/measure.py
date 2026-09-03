@@ -41,6 +41,10 @@ def parse_args(argv=None):
     parser.add_argument("--workload", required=True)
     parser.add_argument("--phase", required=True)
     parser.add_argument("--repetition", required=True, type=int)
+    parser.add_argument("--expected-repetitions", required=True, type=int)
+    parser.add_argument(
+        "--trial-class", required=True, choices=("pilot", "retained")
+    )
     parser.add_argument("--runner-label", required=True)
     parser.add_argument("--host-arch", default=platform.machine())
     parser.add_argument("--target-arch", required=True)
@@ -50,6 +54,12 @@ def parse_args(argv=None):
         args.command = args.command[1:]
     if not args.command:
         parser.error("a command is required after --")
+    if not 1 <= args.repetition <= args.expected_repetitions:
+        parser.error(
+            "repetition must be between 1 and {}".format(
+                args.expected_repetitions
+            )
+        )
     return args
 
 
@@ -70,6 +80,8 @@ def main(argv=None):
         "workload": args.workload,
         "phase": args.phase,
         "repetition": args.repetition,
+        "expected_repetitions": args.expected_repetitions,
+        "trial_class": args.trial_class,
         "runner_label": args.runner_label,
         "host_arch": host_arch,
         "target_arch": target_arch,
