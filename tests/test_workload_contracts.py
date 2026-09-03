@@ -68,6 +68,25 @@ class DockerfileContractTests(unittest.TestCase):
         self.assertIn("make -j 4", cpython)
         self.assertIn("-m test -j 4", cpython)
 
+    def test_brotli_evidence_uses_the_inplace_extension_output_path(self):
+        brotli = self.dockerfile("brotli")
+
+        self.assertIn("readelf -h python/_brotli*.so", brotli)
+        self.assertIn("sha256sum python/_brotli*.so", brotli)
+        self.assertEqual(brotli.count("PYTHONPATH=/src/python"), 2)
+        self.assertNotIn("readelf -h _brotli*.so", brotli)
+        self.assertNotIn("sha256sum _brotli*.so", brotli)
+        self.assertNotIn("PYTHONPATH=/src ", brotli)
+
+    def test_cpython_uses_suites_present_in_the_pinned_314_archive(self):
+        cpython = self.dockerfile("cpython")
+
+        self.assertIn(
+            "./python -m test -j 4 test_json test_math test_re test_statistics test_str",
+            cpython,
+        )
+        self.assertNotIn(" test_unicode ", cpython)
+
     def test_failing_test_output_is_printed_before_the_build_propagates_failure(self):
         for workload in ("brotli", "cpython"):
             with self.subTest(workload=workload):

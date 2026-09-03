@@ -17,7 +17,7 @@ RUN mkdir -p /evidence \
     && readelf -h python > /evidence/elf-header.txt \
     && grep -q 'Machine:.*AArch64' /evidence/elf-header.txt \
     && sha256sum python > /evidence/artifact-sha256.txt \
-    && { test_status=0; ./python -m test -j 4 test_json test_math test_re test_statistics test_unicode > /evidence/tests.txt 2>&1 || test_status=$?; cat /evidence/tests.txt; test "${test_status}" -eq 0; } \
+    && { test_status=0; ./python -m test -j 4 test_json test_math test_re test_statistics test_str > /evidence/tests.txt 2>&1 || test_status=$?; cat /evidence/tests.txt; test "${test_status}" -eq 0; } \
     && printf '{"suite":"cpython-regression-subset","status":"passed"}\n' > /evidence/test-result.json
 
 FROM scratch AS evidence

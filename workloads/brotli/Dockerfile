@@ -13,12 +13,12 @@ ARG BENCHMARK_ITERATION=0
 RUN mkdir -p /evidence \
     && printf '%s\n' "${BENCHMARK_ITERATION}" > /benchmark-iteration \
     && python setup.py build_ext --inplace -j 4 \
-    && readelf -h _brotli*.so > /evidence/elf-header.txt \
+    && readelf -h python/_brotli*.so > /evidence/elf-header.txt \
     && grep -q 'Machine:.*AArch64' /evidence/elf-header.txt \
-    && sha256sum _brotli*.so > /evidence/artifact-sha256.txt \
-    && { test_status=0; PYTHONPATH=/src python -m unittest discover -s python -p '*_test.py' > /evidence/tests.txt 2>&1 || test_status=$?; cat /evidence/tests.txt; test "${test_status}" -eq 0; } \
+    && sha256sum python/_brotli*.so > /evidence/artifact-sha256.txt \
+    && { test_status=0; PYTHONPATH=/src/python python -m unittest discover -s python -p '*_test.py' > /evidence/tests.txt 2>&1 || test_status=$?; cat /evidence/tests.txt; test "${test_status}" -eq 0; } \
     && printf '{"suite":"brotli-unittest","status":"passed"}\n' > /evidence/test-result.json \
-    && PYTHONPATH=/src python -c "import brotli,hashlib; p=(b'native-arm64-copilot-sandbox\\n'*(64*1024*1024//29+1))[:64*1024*1024]; c=brotli.compress(p,quality=11); assert brotli.decompress(c)==p; print('brotli-roundtrip',len(p),len(c),hashlib.sha256(p).hexdigest())" > /evidence/compression.txt \
+    && PYTHONPATH=/src/python python -c "import brotli,hashlib; p=(b'native-arm64-copilot-sandbox\\n'*(64*1024*1024//29+1))[:64*1024*1024]; c=brotli.compress(p,quality=11); assert brotli.decompress(c)==p; print('brotli-roundtrip',len(p),len(c),hashlib.sha256(p).hexdigest())" > /evidence/compression.txt \
     && cat /evidence/compression.txt
 
 FROM scratch AS evidence
