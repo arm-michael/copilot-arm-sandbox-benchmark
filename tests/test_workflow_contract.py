@@ -109,9 +109,29 @@ class WorkflowContractTests(unittest.TestCase):
 
         self.assertIn("--target evidence", evidence["run"])
         self.assertIn("--output type=local", evidence["run"])
+        for filename in (
+            "elf-header.txt",
+            "artifact-sha256.txt",
+            "tests.txt",
+            "test-result.json",
+        ):
+            self.assertIn('test -s "${evidence_dir}/' + filename + '"', evidence["run"])
+        self.assertIn('result.get("status") != "passed"', evidence["run"])
+        self.assertLess(steps.index(evidence), steps.index(finalize))
         self.assertEqual(finalize["if"], "always()")
+        self.assertEqual(
+            finalize["env"],
+            {
+                "MEASURE_OUTCOME": "${{ steps.measure.outcome }}",
+                "EVIDENCE_OUTCOME": "${{ steps.evidence.outcome }}",
+                "SMOKE_OUTCOME": "${{ steps.smoke.outcome }}",
+            },
+        )
         self.assertIn("job-elapsed-seconds", finalize["run"])
         self.assertIn("binfmt-version", finalize["run"])
+        self.assertIn('"phase": "verification"', finalize["run"])
+        self.assertIn("MEASURE_OUTCOME", finalize["run"])
+        self.assertIn("EVIDENCE_OUTCOME", finalize["run"])
 
     def test_every_treatment_records_intent_before_checkout_and_measures_fixture_fetch(self):
         workflow = load_workflow()

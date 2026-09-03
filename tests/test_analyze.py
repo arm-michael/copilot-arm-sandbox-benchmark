@@ -29,6 +29,7 @@ def record(
     expected_repetitions=1,
     trial_class="retained",
     phase="build-test",
+    git_sha="abc123",
 ):
     return {
         "schema_version": 2,
@@ -48,7 +49,7 @@ def record(
         "elapsed_seconds": seconds,
         "exit_code": exit_code,
         "command": ["benchmark"],
-        "git_sha": "abc123",
+        "git_sha": git_sha,
         "runner_image_os": "ubuntu24",
         "runner_image_version": "20260901.1",
     }
@@ -56,7 +57,7 @@ def record(
 
 class AnalysisTests(unittest.TestCase):
     def sample_records(self):
-        return [
+        records = [
             record("block-1", "emulated", 10, 1, expected_repetitions=3),
             record("block-1", "emulated", 12, 2, expected_repetitions=3),
             record("block-1", "emulated", 100, 3, expected_repetitions=3),
@@ -126,6 +127,19 @@ class AnalysisTests(unittest.TestCase):
                 expected_repetitions=2,
             ),
         ]
+        for block in ("block-1", "block-2"):
+            expected_repetitions = 3 if block == "block-1" else 1
+            for mode in ("emulated", "native"):
+                records.append(
+                    record(
+                        block,
+                        mode,
+                        0,
+                        phase="verification",
+                        expected_repetitions=expected_repetitions,
+                    )
+                )
+        return records
 
     def test_vm_medians_reduce_repetitions_and_exclude_failures(self):
         medians = vm_medians(self.sample_records())
@@ -171,6 +185,128 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("fetch-failed", reasons)
         self.assertIn("emulated fetch failure", reasons["fetch-failed"])
 
+    def test_pair_requires_successful_post_timing_verification_for_both_treatments(self):
+        records = [
+            record("verified", "emulated", 10),
+            record("verified", "native", 2),
+            record("verified", "emulated", 0, phase="verification"),
+            record("verified", "native", 0, phase="verification", exit_code=1),
+        ]
+
+        pairs, exclusions = pairing_analysis(records)
+
+        self.assertEqual(pairs, [])
+        self.assertIn("native verification failure", exclusions[0]["reason"])
+
+    def test_pair_with_missing_post_timing_verification_is_excluded(self):
+        records = [
+            record("missing-verification", "emulated", 10),
+            record("missing-verification", "native", 2),
+            record("missing-verification", "emulated", 0, phase="verification"),
+        ]
+
+        pairs, exclusions = pairing_analysis(records)
+
+        self.assertEqual(pairs, [])
+        self.assertIn("missing native post-timing verification", exclusions[0]["reason"])
+
+    def test_pair_requires_one_shared_nonempty_harness_sha(self):
+        records = [
+            record("sha-mismatch", "emulated", 10, git_sha="aaa"),
+            record("sha-mismatch", "native", 2, git_sha="bbb"),
+            record("sha-mismatch", "emulated", 0, phase="verification", git_sha="aaa"),
+            record("sha-mismatch", "native", 0, phase="verification", git_sha="bbb"),
+        ]
+
+        pairs, exclusions = pairing_analysis(records)
+
+        self.assertEqual(pairs, [])
+        self.assertIn("different git_sha", exclusions[0]["reason"])
+
+    def test_pair_rejects_blank_or_whitespace_only_harness_sha(self):
+        for git_sha in ("", "   "):
+            with self.subTest(git_sha=repr(git_sha)):
+                records = [
+                    record("blank-sha", "emulated", 10, git_sha=git_sha),
+                    record("blank-sha", "native", 2, git_sha=git_sha),
+                    record(
+                        "blank-sha",
+                        "emulated",
+                        0,
+                        phase="verification",
+                        git_sha=git_sha,
+                    ),
+                    record(
+                        "blank-sha",
+                        "native",
+                        0,
+                        phase="verification",
+                        git_sha=git_sha,
+                    ),
+                ]
+
+                pairs, exclusions = pairing_analysis(records)
+
+                self.assertEqual(pairs, [])
+                self.assertIn("blank git_sha", exclusions[0]["reason"])
+
+    def test_pair_rejects_duplicate_or_mismatched_verification_records(self):
+        duplicate = [
+            record("duplicate-verification", "emulated", 10),
+            record("duplicate-verification", "native", 2),
+            record("duplicate-verification", "emulated", 0, phase="verification"),
+            record("duplicate-verification", "emulated", 0, phase="verification"),
+            record("duplicate-verification", "native", 0, phase="verification"),
+        ]
+        mismatched_count = [
+            record(
+                "verification-count",
+                "emulated",
+                10,
+                expected_repetitions=2,
+            ),
+            record(
+                "verification-count",
+                "emulated",
+                11,
+                repetition=2,
+                expected_repetitions=2,
+            ),
+            record(
+                "verification-count",
+                "native",
+                2,
+                expected_repetitions=2,
+            ),
+            record(
+                "verification-count",
+                "native",
+                3,
+                repetition=2,
+                expected_repetitions=2,
+            ),
+            record(
+                "verification-count",
+                "emulated",
+                0,
+                phase="verification",
+                expected_repetitions=1,
+            ),
+            record(
+                "verification-count",
+                "native",
+                0,
+                phase="verification",
+                expected_repetitions=2,
+            ),
+        ]
+
+        _, duplicate_exclusions = pairing_analysis(duplicate)
+        _, count_exclusions = pairing_analysis(mismatched_count)
+
+        self.assertIn("duplicate emulated", duplicate_exclusions[0]["reason"])
+        self.assertIn("verification repetition count", count_exclusions[0]["reason"])
+
     def test_incomplete_or_malformed_schema_is_rejected(self):
         missing_command = record("bad", "native", 1)
         missing_command.pop("command")
@@ -196,6 +332,20 @@ class AnalysisTests(unittest.TestCase):
         records = self.sample_records() + [
             record("python-block", "emulated", 30, workload="cpython"),
             record("python-block", "native", 10, workload="cpython"),
+            record(
+                "python-block",
+                "emulated",
+                0,
+                workload="cpython",
+                phase="verification",
+            ),
+            record(
+                "python-block",
+                "native",
+                0,
+                workload="cpython",
+                phase="verification",
+            ),
         ]
 
         report = render_markdown(records, bootstrap_samples=200)
@@ -244,6 +394,10 @@ class AnalysisCliTests(unittest.TestCase):
             report = markdown.read_text(encoding="utf-8")
             self.assertIn("Brotli", report)
             self.assertIn("2 paired blocks", report)
+            self.assertIn("Median x64 + QEMU", report)
+            self.assertIn("Median native ARM64", report)
+            self.assertIn("16.00 s", report)
+            self.assertIn("3.50 s", report)
             self.assertIn("4.50x", report)
             self.assertIn("4.47x", report)
             self.assertIn("4.00x–5.00x", report)
@@ -257,6 +411,7 @@ class AnalysisCliTests(unittest.TestCase):
                 pairs = list(csv.DictReader(stream))
             self.assertEqual(len(pairs), 2)
             self.assertEqual([row["block_id"] for row in pairs], ["block-1", "block-2"])
+            self.assertEqual({row["git_sha"] for row in pairs}, {"abc123"})
 
 
 if __name__ == "__main__":

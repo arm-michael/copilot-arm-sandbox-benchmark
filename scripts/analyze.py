@@ -213,7 +213,7 @@ def pairing_analysis(records):
     for row in records:
         if (
             row["trial_class"] == "retained"
-            and row["phase"] not in {"attempt", "build-test"}
+            and row["phase"] not in {"attempt", "build-test", "verification"}
             and row["exit_code"] != 0
         ):
             key = (row["block_id"], row["workload"], "build-test")
@@ -222,6 +222,13 @@ def pairing_analysis(records):
                     row["execution_mode"], row["phase"], row["exit_code"]
                 )
             )
+    verifications = {}
+    for row in records:
+        if row["trial_class"] == "retained" and row["phase"] == "verification":
+            key = (row["block_id"], row["workload"], "build-test")
+            verifications.setdefault(key, {}).setdefault(
+                row["execution_mode"], []
+            ).append(row)
     pairs = []
     exclusions = []
     for block_id, workload, phase in sorted(primary_keys):
@@ -234,6 +241,47 @@ def pairing_analysis(records):
             if (error_block, error_workload, error_phase) == pair_key
         ]
         relevant_errors.extend(sorted(setup_failures.get(pair_key, [])))
+        block_rows = [
+            row
+            for row in records
+            if row["trial_class"] == "retained"
+            and row["block_id"] == block_id
+            and row["workload"] == workload
+        ]
+        git_shas = {row["git_sha"] for row in block_rows}
+        if any(not value.strip() for value in git_shas):
+            relevant_errors.append("blank git_sha in retained block")
+        if len(git_shas) > 1:
+            relevant_errors.append("treatments or phases use different git_sha values")
+        verification_modes = verifications.get(pair_key, {})
+        for mode in sorted(TREATMENTS):
+            rows = verification_modes.get(mode, [])
+            if not rows:
+                relevant_errors.append("missing {} post-timing verification".format(mode))
+            elif len(rows) > 1:
+                relevant_errors.append("duplicate {} post-timing verification".format(mode))
+            elif rows[0]["exit_code"] != 0:
+                relevant_errors.append(
+                    "{} verification failure (exit {})".format(
+                        mode, rows[0]["exit_code"]
+                    )
+                )
+            else:
+                primary_counts = {
+                    row["expected_repetitions"]
+                    for row in block_rows
+                    if row["phase"] == "build-test"
+                    and row["execution_mode"] == mode
+                }
+                if (
+                    len(primary_counts) == 1
+                    and rows[0]["expected_repetitions"] != next(iter(primary_counts))
+                ):
+                    relevant_errors.append(
+                        "{} verification repetition count does not match primary timing".format(
+                            mode
+                        )
+                    )
         modes = treatments.get(pair_key, {})
         missing_modes = sorted({"emulated", "native"} - set(modes))
         if relevant_errors or missing_modes:
@@ -284,6 +332,7 @@ def pairing_analysis(records):
                 "emulated_seconds": emulated,
                 "native_seconds": native,
                 "speedup": emulated / native,
+                "git_sha": next(iter(git_shas)),
             }
         )
     return pairs, exclusions
@@ -324,18 +373,25 @@ def render_markdown(records, bootstrap_samples):
     groups = {}
     for row in pairs:
         key = (row["workload"], row["phase"])
-        groups.setdefault(key, []).append(row["speedup"])
+        groups.setdefault(key, []).append(row)
 
     lines = [
         "# Benchmark results",
         "",
         "Generated from append-only JSONL records. Speedup is x64-hosted QEMU time divided by native ARM64 time; values above 1 favor native ARM64.",
         "",
-        "| Workload | Phase | Paired observations | Median | Geometric mean | Paired bootstrap 95% CI |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
+        "| Workload | Phase | Paired observations | Median x64 + QEMU | Median native ARM64 | Median speedup | Geometric mean speedup | Paired bootstrap 95% CI |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     range_lines = []
-    for (workload, phase), values in sorted(groups.items()):
+    for (workload, phase), group_pairs in sorted(groups.items()):
+        values = [row["speedup"] for row in group_pairs]
+        emulated_seconds = statistics.median(
+            row["emulated_seconds"] for row in group_pairs
+        )
+        native_seconds = statistics.median(
+            row["native_seconds"] for row in group_pairs
+        )
         median = statistics.median(values)
         geometric_mean = math.exp(sum(math.log(value) for value in values) / len(values))
         confidence_interval = "not estimated"
@@ -343,10 +399,12 @@ def render_markdown(records, bootstrap_samples):
             low, high = bootstrap_ci(values, samples=bootstrap_samples)
             confidence_interval = "{:.2f}x–{:.2f}x".format(low, high)
         lines.append(
-            "| {} | {} | {} paired blocks | {:.2f}x | {:.2f}x | {} |".format(
+            "| {} | {} | {} paired blocks | {:.2f} s | {:.2f} s | {:.2f}x | {:.2f}x | {} |".format(
                 workload.replace("-", " ").title(),
                 phase.replace("-", " "),
                 len(values),
+                emulated_seconds,
+                native_seconds,
                 median,
                 geometric_mean,
                 confidence_interval,
@@ -358,7 +416,9 @@ def render_markdown(records, bootstrap_samples):
             )
         )
     if not groups:
-        lines.append("| No complete pairs | — | 0 paired blocks | — | — | — |")
+        lines.append(
+            "| No complete pairs | — | 0 paired blocks | — | — | — | — | — |"
+        )
     if range_lines:
         lines.extend([""] + range_lines)
     primary = list(primary_records(records))
@@ -404,7 +464,7 @@ def render_markdown(records, bootstrap_samples):
         lines.append("")
     lines.extend(
         [
-            "Actions runners are a controlled proxy for Copilot cloud-agent sandboxes. CPU models differ, so these ratios compare the offered runner choices rather than isolating pure QEMU overhead.",
+            "Actions runners are a mechanism proxy, not the Azure Container Apps Sandboxes substrate used by Copilot cloud sandboxes. CPU models also differ, so these ratios compare the offered runner choices rather than isolating pure QEMU overhead or measuring current Copilot sandbox speed.",
             "",
         ]
     )
@@ -458,6 +518,7 @@ def main(argv=None):
                 "emulated_seconds",
                 "native_seconds",
                 "speedup",
+                "git_sha",
             ),
         )
     except Exception as error:

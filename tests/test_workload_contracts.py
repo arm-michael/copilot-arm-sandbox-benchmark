@@ -82,10 +82,16 @@ class DockerfileContractTests(unittest.TestCase):
         cpython = self.dockerfile("cpython")
 
         self.assertIn(
-            "./python -m test -j 4 test_json test_math test_re test_statistics test_str",
+            "./python -m test -j 4 --randseed=20260903 "
+            "test_json test_math test_re test_statistics test_str",
             cpython,
         )
         self.assertNotIn(" test_unicode ", cpython)
+
+    def test_cpython_pins_the_regrtest_random_seed(self):
+        cpython = self.dockerfile("cpython")
+
+        self.assertIn("-m test -j 4 --randseed=20260903", cpython)
 
     def test_failing_test_output_is_printed_before_the_build_propagates_failure(self):
         for workload in ("brotli", "cpython"):

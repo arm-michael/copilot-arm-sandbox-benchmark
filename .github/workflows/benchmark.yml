@@ -173,6 +173,7 @@ jobs:
           date +%s%N > metadata/setup-complete-ns.txt
 
       - name: Measure target execution smoke test
+        id: smoke
         if: matrix.workload == 'smoke'
         shell: bash
         run: |
@@ -285,10 +286,31 @@ jobs:
             --output type=local,dest='evidence/${{ matrix.workload }}' \
             --progress plain \
             'workloads/${{ matrix.workload }}'
+          evidence_dir='evidence/${{ matrix.workload }}'
+          test -s "${evidence_dir}/elf-header.txt"
+          test -s "${evidence_dir}/artifact-sha256.txt"
+          test -s "${evidence_dir}/tests.txt"
+          test -s "${evidence_dir}/test-result.json"
+          python3 - "${evidence_dir}/test-result.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              result = json.load(stream)
+          if result.get("status") != "passed":
+              raise SystemExit("correctness evidence is not passing")
+          PY
+          if [[ '${{ matrix.workload }}' == brotli ]]; then
+            test -s "${evidence_dir}/compression.txt"
+          fi
 
       - name: Finalize job and tool evidence
         id: finalize
         if: always()
+        env:
+          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         shell: bash
         run: |
           set -euo pipefail
@@ -313,6 +335,45 @@ jobs:
           else
             printf '%s\n' 'not used for native ARM64 treatment' > metadata/binfmt-version.txt
           fi
+          python3 - >> "${RESULT_FILE}" <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+
+          is_smoke = os.environ["BENCH_WORKLOAD"] == "smoke"
+          outcomes = (
+              [os.environ.get("SMOKE_OUTCOME", "")]
+              if is_smoke
+              else [
+                  os.environ.get("MEASURE_OUTCOME", ""),
+                  os.environ.get("EVIDENCE_OUTCOME", ""),
+              ]
+          )
+          host_arch = os.environ["BENCH_HOST_ARCH"]
+          record = {
+              "schema_version": 2,
+              "block_id": "{}.{}".format(
+                  os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+              ),
+              "workload": os.environ["BENCH_WORKLOAD"],
+              "phase": "verification",
+              "repetition": 1,
+              "expected_repetitions": int(os.environ["REPETITIONS"]),
+              "trial_class": os.environ["TRIAL_CLASS"],
+              "runner_label": os.environ["BENCH_RUNNER_LABEL"],
+              "host_arch": host_arch,
+              "target_arch": "arm64",
+              "execution_mode": "native" if host_arch == "arm64" else "emulated",
+              "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "elapsed_seconds": 0.0,
+              "exit_code": 0 if all(value == "success" for value in outcomes) else 1,
+              "command": ["workflow-step-outcomes"] + outcomes,
+              "git_sha": os.environ.get("GITHUB_SHA", ""),
+              "runner_image_os": os.environ.get("ImageOS", ""),
+              "runner_image_version": os.environ.get("ImageVersion", ""),
+          }
+          print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+          PY
 
       - name: Upload raw measurements and metadata
         id: upload
